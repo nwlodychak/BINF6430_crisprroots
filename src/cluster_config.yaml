@@ -1,0 +1,91 @@
+__default__:
+    partition: courses
+    time: "24:00:00"
+    mem: "32G"
+    cpus: 4
+    output: "/courses/BINF6430.202510/students/wlodychak.s/final_project/logs/{rule}_{wildcards}.out"
+    error: "/courses/BINF6430.202510/students/wlodychak.s/final_project/logs/{rule}_{wildcards}.err"
+
+CUTADAPT_cleaning:
+    job-name: Cutadapt
+    cpus-per-task: 6
+    mem-per-cpu: 32G
+    partition: courses
+
+BBDUK_filter_rrna:
+    job-name: BBduck
+    cpus-per-task: 8
+    mem-per-cpu: 32G
+    partition: courses
+
+STAR_align2pass:
+    job-name: STAR
+    mem: 64G
+    cpus: 12
+    partition: courses
+
+PICARD_sortaligned:
+    job-name: Picard
+    cpus-per-task: 8
+    mem-per-cpu: 32G
+    partition: bullseye
+
+GATK_markdup:
+    job-name: GATK_markdup
+    cpus-per-task: 12
+    mem-per-cpu: 32G
+    partition: courses
+
+GATK_splitncigar:
+    job-name: GATK_splitcigar
+    cpus-per-task: 12
+    mem-per-cpu: 32G
+    partition: courses
+
+GATK_haplotypecaller:
+    job-name: HaplotypeCaller
+    cpus-per-task: 12
+    mem-per-cpu: 32G
+    partition: courses
+
+BEDTOOLS_intersect_variants_genes:
+    job-name: BEDtools_intersect
+    cpus-per-task: 12
+    mem-per-cpu: 32G
+    partition: courses
+
+RIsearch2_indexing:
+    job-name: RIsearch_indexing
+    cpus-per-task: 16
+    mem: 60G
+    partition: courses
+
+RIsearch2_search:
+    job-name: RIsearch_search
+    cpus-per-task: 16
+    mem: 64G
+    partition: courses
+
+CRISPRoff:
+    job-name: CRISPRoff
+    cpus-per-task: 16
+    mem: 12G
+    partition: courses
+
+GATK_mutect2_chromosome_wise:
+    job-name: Mutect2
+    cpus-per-task: 16
+    mem-per-cpu: 64G
+    partition: courses
+
+FEATURECOUNTS_quantification:
+    job-name: FeatureCounts
+    cpus-per-task: 8
+    mem-per-cpu: 32G
+    partition: courses
+
+SAMTOOLS_flag:
+    job-name: Samtools_flag
+    cpus-per-task: 8
+    mem-per-cpu: 16G
+    partition: courses
