@@ -1,0 +1,604 @@
+```{r}
+# Load required library
+suppressPackageStartupMessages({
+    library(RColorBrewer)
+    library(pheatmap)
+    library(ggplot2)
+    library(ggrepel)
+    library(ggridges)
+    library(DOSE)
+    library(stringr)
+    library(tidyverse)
+    library(magrittr)
+    library(dplyr)
+    library(cowplot)
+    library(GenomicFeatures)
+    library(DESeq2)
+    library(DEGreport)
+    library(apeglm)
+    library(tximport)
+    library(biomaRt)
+    library(clusterProfiler)
+    library(pathview)
+    library(enrichplot)
+    library(msigdbr)
+    library(org.Hs.eg.db)
+    library(readxl)
+})
+
+```
+
+```{r}
+# Function to get transcript to gene mapping
+get_transcript_to_gene <- function() {
+   human_mart         <- biomaRt::useMart("ENSEMBL_MART_ENSEMBL",
+                                          dataset = "hsapiens_gene_ensembl",
+                                          host = "useast.ensembl.org")
+   transcript_to_gene <- biomaRt::getBM(
+      attributes = c(
+         "ensembl_transcript_id",
+         "transcript_version",
+         "ensembl_gene_id",
+         "description",
+         "external_gene_name"
+      ),
+      mart       = human_mart
+   )
+
+   transcript_to_gene$ensembl_transcript_id <- paste(
+      transcript_to_gene$ensembl_transcript_id,
+      transcript_to_gene$transcript_version,
+      sep = "."
+   )
+
+   t2g <- dplyr::rename(
+      transcript_to_gene,
+      target_id = ensembl_transcript_id,
+      ens_gene  = ensembl_gene_id,
+      ext_gene  = external_gene_name
+   )[, c("target_id", "ens_gene", "description", "ext_gene")]
+
+   return(t2g)
+}
+
+
+gse_func <- function(DE = DE, p_val = NULL) {
+   ###################################################################
+   # Take the gene set and perform Go enrichment
+   # Returns a list containing, gse, gse_enrich, gse_pairwise, gse_do
+   ###################################################################
+   if (!is.null(p_val)) {
+      p_val <- p_val
+   } else {
+      p_val <- 0.1
+   }
+   original_gene_list        <- DE$log2FoldChange
+   names(original_gene_list) <- DE$gene
+   
+   gene_list                 <- na.omit(original_gene_list)
+   gene_list                 <- sort(original_gene_list, decreasing = T)
+   gse_enrich                <- enrichGO(names(gene_list),
+                                         ont           = "BP",
+                                         keyType       = "ENSEMBL",
+                                         minGSSize     = 3,
+                                         maxGSSize     = 800,
+                                         pvalueCutoff  = p_val,
+                                         OrgDb         = org.Hs.eg.db,
+                                         pAdjustMethod = "none")
+   gse                       <- gseGO(geneList      = gene_list,
+                                      ont           = "BP",
+                                      keyType       = "ENSEMBL",
+                                      minGSSize     = 3,
+                                      maxGSSize     = 800,
+                                      pvalueCutoff  = 1,
+                                      verbose       = TRUE,
+                                      OrgDb         = org.Hs.eg.db,
+                                      pAdjustMethod = "none")
+   gse_pairwise              <- pairwise_termsim(gse)
+
+   original_gene_list_entrez        <- original_gene_list
+   names(original_gene_list_entrez) <- DE$entrez
+   gene_list_entrez                 <- na.omit(original_gene_list_entrez)
+   gene_list_entrez                 <- sort(original_gene_list_entrez, decreasing = T)
+   gse_do                           <- gseDO(gene_list_entrez, pvalueCutoff = 1)
+
+   return(list(gse          = gse,
+               gse_enrich   = gse_enrich,
+               gse_pairwise = gse_pairwise,
+               gse_do       = gse_do))
+}
+
+
+results_function <- function(dds, alpha = 0.1, contrast, coef) {
+   ###################################################################
+   #
+   #
+   ###################################################################
+   res        <- results(dds, contrast = contrast, alpha = alpha)
+   res_before <- res
+   res        <- lfcShrink(
+      dds,
+      res  = res,
+      coef = coef,
+      type = "apeglm")
+
+   plot_ma_function <- function(res, title) {
+      ma <- plotMA(res, ylim = c(-2, 2), cex = .8, main = title) +
+         abline(h = c(-1, 1), col = 'red', lwd = 2)
+      return(ma)
+   }
+
+   ma_before <- plot_ma_function(res_before, "Before")
+   ma_after  <- plot_ma_function(res, "After")
+   return(list(res = res, res_before = res_before, ma = ma_after, ma_before = ma_before))
+}
+
+results_wrangling <- function(res, pval, grch38annot) {
+    ###################################################
+    # Cleans and returns a DE object using the res
+    ###################################################
+    # Create results tibble
+    res_tb <- as.data.frame(res)
+    
+    # Clean Ensembl IDs by removing version numbers
+    genes <- sub("\\.[0-9]+$", "", rownames(res_tb))
+    res_tb <- as_tibble(res_tb)
+    res_tb$gene <- genes
+    
+    # Filter for DE genes
+    DE <- res_tb %>% 
+        filter(padj < pval & abs(log2FoldChange) > 1)
+    
+    # Clean Ensembl IDs before mapping
+    DE$gene <- sub("\\.[0-9]+$", "", DE$gene)
+    
+    # Add gene annotations with cleaned IDs
+    DE$symbol <- mapIds(
+        org.Hs.eg.db,
+        keys = DE$gene,
+        column = "SYMBOL",
+        keytype = "ENSEMBL",
+        multiVals = "first"
+    )
+    
+    DE$entrez <- mapIds(
+        org.Hs.eg.db,
+        keys = DE$gene,
+        column = "ENTREZID",
+        keytype = "ENSEMBL",
+        multiVals = "first"
+    )
+    
+    # Process results table
+    res_tb <- na.omit(res_tb %>% 
+        mutate(threshold_OE = padj < pval & abs(log2FoldChange) >= 1))
+    
+    # Add gene symbols using grch38annot
+    grch_symbol <- grch38annot$ext_gene[match(res_tb$gene, grch38annot$ens_gene)]
+    res_tb$symbol <- grch_symbol
+    
+    # Add gene labels
+    res_tb <- res_tb %>% 
+        mutate(genelabels = "") %>% 
+        arrange(pval)
+    res_tb$genelabels[res_tb$threshold_OE == TRUE] <- 
+        as.character(res_tb$symbol[res_tb$threshold_OE == TRUE])
+    
+    return(list(res_tb = res_tb, DE = DE))
+}
+
+
+
+###############################################################################
+# Plotting Functions
+###############################################################################
+
+dispersion_plots <- function(data, dds) {
+   mean_counts     <- apply(data[, c(2, 4, 6)], 1, mean)
+   variance_counts <- apply(data[, c(2, 4, 6)], 1, var)
+   dispersion_plot <- data.frame(mean_counts, variance_counts) %>% ggplot() +
+      geom_point(aes(x = mean_counts, y = variance_counts)) +
+      geom_line(aes(x = mean_counts, y = mean_counts, color = "red")) +
+      scale_y_log10() +
+      scale_x_log10()
+   disp_ests_plot  <- plotDispEsts(dds)
+   return(list(dispersion_plot = dispersion_plot, disp_ests_plot = disp_ests_plot))
+}
+
+plotPCAWithBatchEffect <- function(dds, title_text, intgroup) {
+   vsd <- vst(dds, blind = FALSE)
+
+   plotPCAData <- function(vsd, intgroup) {
+      pca_data   <- plotPCA(vsd, intgroup = intgroup, returnData = TRUE)
+      percentVar <- round(100 * attr(pca_data, "percentVar"))
+      pca        <- ggplot(pca_data, aes(PC1, PC2, color = Condition)) +
+         geom_point(size = 2) +
+         xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+         ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+         coord_fixed()
+   }
+
+   pca_before <- plotPCAData(vsd, intgroup)
+   assay(vsd) <- limma::removeBatchEffect(assay(vsd), vsd$replicate)
+   pca_after  <- plotPCAData(vsd, intgroup)
+
+   title <- ggdraw() +
+      draw_label(title_text, fontface = 'bold', x = 0, hjust = 0)
+
+   p <- plot_grid(title, pca_before, pca_after, ncol = 1, rel_heights = c(0.1, 1, 1))
+   return(list(pca_plot = p, vsd = vsd))
+}
+
+volcano_plot_func <- function(res_tb = res_tb,
+                              plot_title = NULL) {
+   ###################################################################
+   # Take differential gene expression data frame and generate volcano
+   # plots with the ggplot library.
+   # Returns a single plot and saves to a png in the working dir.
+   ###################################################################
+   if (!is.null(plot_title)) {
+      plot_title <- plot_title
+   } else {
+      plot_title <- "Volcano Plot"
+   }
+  
+   p <- ggplot(data = res_tb,
+               aes(x = log2FoldChange,
+                   y = -log10(padj))) +
+      geom_point(aes(colour = threshold_OE),
+                 shape = 16,
+                 size = 3) +
+     scale_color_manual(values = c(
+         "TRUE" = viridis::mako(10)[1],
+         "FALSE" = viridis::mako(10)[8]
+      )) +
+      geom_text_repel(aes(label = genelabels)) +
+      ggtitle(paste0(plot_title)) +
+      xlab("log2 fold change") +
+      ylab("-log10 adjusted p-value") +
+      theme_light() +
+      theme(legend.position = "none",
+            plot.title      = element_text(size = rel(1.5), hjust = 0.5),
+            axis.title      = element_text(size = rel(1.25)))
+   return(p)
+}
+
+deg_report_func <- function(res_tb, dds, DE, group, batch) {
+   ###################################################################
+   # Take differential gene expression data frame and generate volcano
+   # plots with the DEGreport function.
+   # Returns a list containing, degPlot and degVolcano
+   ###################################################################
+
+   rowData(dds)$symbol                              <- mapIds(
+      org.Hs.eg.db,
+      keys      = rownames(dds),
+      column    = "SYMBOL",
+      keytype   = "ENSEMBL",
+      multiVals = "first")
+
+   rowData(dds)$gene <- rownames(dds)
+
+   degPlot(
+      dds   = dds,
+      res   = DE,
+      n     = nrows(DE),
+      genes = DE$gene,
+      xs    = paste0(group),
+      group = paste0(group),
+      ann   = c("gene", "symbol"),
+      batch = paste0(batch))
+   degVolcano(data.frame(res_tb[, c("log2FoldChange", "padj")]),
+              plot_text = data.frame(res_tb[res_tb$threshold_OE == T, c("log2FoldChange", "padj", "genelabels")]))
+   return(list(degPlot = degPlot, degVolcano = degVolcano))
+}
+
+generate_plots <- function(gse_list) {
+   dp       <- dotplot(gse_list$gse_enrich, showCategory = 10)
+   ema      <- emapplot(gse_list$gse_pairwise, font.size = 6, showCategory = 10) + scale_color_gradient()
+   ridge    <- ridgeplot(gse_list$gse) + labs(x = "enrichment distribution")
+   gse_plot <- gseaplot(gse_list$gse, by = "all", title = gse_list$gse$Description[1], geneSetID = 1)
+   dotplot  <- dotplot(gse_list$gse_do)
+   return(list(
+      gse_enrich_dotplot = dp,
+      emapplot           = ema,
+      ridgeplot          = ridge,
+      gseaplot           = gse_plot,
+      dotplot            = dotplot
+   ))
+}
+```
+
+
+```{r}
+featurecount <- as.character('/courses/BINF6430.202510/students/wlodychak.s/final_project/data/pik3ca_dataset/het_results/9_featurecounts_quantification/feature_count.tsv')
+samplesheet <- as.character('/courses/BINF6430.202510/students/wlodychak.s/final_project/data/pik3ca_dataset/sample_info/het_samples_table.tsv')
+formula <- '~ Condition'
+
+
+coldata <- read.csv(samplesheet, sep = '\t', row.names = "Sample_ID")
+
+#count matrix input
+counts <- as.matrix(read.table(featurecount, header = TRUE, row.names = 1, sep = "\t", stringsAsFactors = FALSE, check.names = FALSE))
+
+# Store gene IDs before removing columns
+gene_ids <- rownames(counts)
+
+# Remove the gene information columns but keep gene IDs
+counts <- counts[,6:ncol(counts)]
+counts <- counts[,-1]
+
+# Convert to numeric while preserving row names
+counts <- apply(counts, 2, as.numeric)
+rownames(counts) <- gene_ids
+
+# Clean up column names
+colnames(counts) <- basename(colnames(counts))
+colnames(counts) <- gsub(".Aligned.out.bam", "", colnames(counts))
+
+# Create DESeq dataset
+dds <- DESeqDataSetFromMatrix(
+    countData = counts,
+    colData = coldata,
+    design = as.formula(formula)
+)
+
+
+# Run the DESeq pipeline
+dds <- DESeq(dds)
+
+# Get differential expression results
+res <- results(dds, contrast = c("Condition", "Original", "Edited"))
+dds <- nbinomWaldTest(dds)
+resultsNames(dds)
+res <- lfcShrink(dds, 
+                 coef = "Condition_Original_vs_Edited",
+                 res = res, 
+                 type = "apeglm")
+
+```
+
+```{r}
+
+t2g <- get_transcript_to_gene()
+knitr::kable(head(t2g))
+
+# Results Wrangling
+grch38annot <- t2g %>%
+   dplyr::select(ens_gene, ext_gene) %>%
+   dplyr::distinct()
+results_data <- results_wrangling(res, pval = 0.1, grch38annot)
+DE <- results_data$DE
+res_tb <- results_data$res_tb
+
+# Generate normalized counts
+normalized_counts <- counts(dds, normalized = T) %>%
+      data.frame() %>%
+      rownames_to_column(var = "gene")
+
+normalized_counts$gene <- sub("\\.[0-9]+$", "", normalized_counts$gene)
+    
+# Clean column names if needed
+names(normalized_counts) <- sub("^X", "", names(normalized_counts))
+
+# Merge with annotations using cleaned IDs
+normalized_counts <- merge(normalized_counts, 
+                         grch38annot, 
+                         by.x = "gene", 
+                         by.y = "ens_gene") %>%
+    as_tibble()
+
+norm_sig <- normalized_counts %>% filter(gene %in% DE$gene)
+
+
+
+# Create proper annotation dataframe
+annotation_df <- data.frame(
+    Condition = coldata$Condition,
+    row.names = rownames(coldata)
+)
+
+annotation_colors <- list(
+    Condition = c(
+        Edited = viridis::mako(10)[1],
+        Original = viridis::mako(10)[8]
+    )
+)
+
+# Remove rows with too many zeros or low counts
+plot_df <- normalized_counts[, 2:7]
+plot_df <- as.matrix(plot_df)
+
+# Filter rows with sufficient expression
+keep <- rowSums(plot_df > 1) >= 3
+plot_df <- plot_df[keep,]
+
+# Set row names
+rownames(plot_df) <- normalized_counts$gene[keep]
+heat_colors <- viridis::viridis(100, option = "mako")
+
+# Create heatmap with modified parameters
+p1 <- pheatmap(plot_df,
+               color = heat_colors,
+               cluster_rows = TRUE,
+               cluster_cols = TRUE,
+               show_rownames = FALSE,
+               annotation_col = annotation_df,
+               annotation_colors = annotation_colors,
+               border_color = NA,
+               fontsize = 10,
+               scale = "row",
+               clustering_distance_rows = "correlation",
+               clustering_distance_cols = "correlation",
+               clustering_method = "complete",
+               gaps_col = 3,  # Add gap between conditions
+               height = 20)
+
+save_pheatmap_pdf <- function(x, filename, width=7, height=7) {
+    stopifnot(!missing(x))
+    stopifnot(!missing(filename))
+    pdf(filename, width=width, height=height)
+    grid::grid.newpage()
+    grid::grid.draw(x$gtable)
+    dev.off()
+}
+
+save_pheatmap_pdf(p1,"/courses/BINF6430.202510/students/wlodychak.s/final_project/data/pik3ca_dataset/results/het.hm.pdf", width = 5, height = 7)
+
+
+# Create plots
+# PCA plots
+pca_results <- plotPCAWithBatchEffect(dds, "PCA of PIK3CA samples", "Condition")
+
+# Volcano plot
+volcano_plot <- volcano_plot_func(res_tb, "PIK3CA H1047R vs WT")
+ggsave(plot = volcano_plot, filename = "/courses/BINF6430.202510/students/wlodychak.s/final_project/data/pik3ca_dataset/results/het.vol.png", h = 7, w = 7)
+```
+
+```{r}
+original_gene_list        <- DE$log2FoldChange
+ names(original_gene_list) <- DE$gene
+ 
+ gene_list                 <- na.omit(original_gene_list)
+ gene_list                 <- sort(original_gene_list, decreasing = T)
+ gse_enrich                <- enrichGO(names(gene_list),
+                                       ont           = "BP",
+                                       keyType       = "ENSEMBL",
+                                       minGSSize     = 3,
+                                       maxGSSize     = 800,
+                                       pvalueCutoff  = 0.1,
+                                       OrgDb         = org.Hs.eg.db,
+                                       pAdjustMethod = "none")
+ gse                       <- gseGO(geneList      = gene_list,
+                                    ont           = "BP",
+                                    keyType       = "ENSEMBL",
+                                    minGSSize     = 3,
+                                    maxGSSize     = 800,
+                                    pvalueCutoff  = 1,
+                                    verbose       = TRUE,
+                                    OrgDb         = org.Hs.eg.db,
+                                    pAdjustMethod = "none")
+ gse_pairwise              <- pairwise_termsim(gse)
+
+ original_gene_list_entrez        <- original_gene_list
+ names(original_gene_list_entrez) <- DE$entrez
+ gene_list_entrez                 <- na.omit(original_gene_list_entrez)
+ gene_list_entrez                 <- sort(original_gene_list_entrez, decreasing = T)
+ gse_do                           <- gseDO(gene_list_entrez, pvalueCutoff = 1)
+
+# Perform GSE analysis
+dp  <- dotplot(gse_enrich, showCategory = 10)
+
+# Generate GSE plots
+gse_plots <- generate_plots(gse_results)
+
+# Create dispersion plots
+disp_plots <- dispersion_plots(counts, dds)
+
+# Create heatmap
+pheatmap_result <- pheatmap_func(normalized_counts, coldata)
+
+```
+
+```{r}
+library(viridis)
+library(forcats)
+library(stringr)
+# This function plots a value on the y-axis with a grouping along the x. The fill_cond will separate the bars for a group on dodge using an identifier.
+# This way the data can be split into 2 separate configurations with parent on X and children as fill
+# The stat_df will be generated with the statdf_func
+
+global_plotting <- function(data, value, x_labels = NULL, y_labels = NULL, x_cond, fill_cond, chart_title, max, min, stat) {
+   # Option to title axes, otherwise use the data title
+   if (is.null(x_labels))
+      x_labels <- paste(x_cond)
+   if (is.null(y_labels))
+      y_labels <- paste(value)
+
+   data[[fill_cond]] <- as.numeric(as.character(data[[fill_cond]]))
+   stat_df <- data %>%
+   mutate(Description = fct_reorder(Description, FoldEnrichment, .desc = FALSE))
+
+   # Bar plot
+   p1 <- stat_df %>%
+      ggplot() +
+      geom_bar(aes(x = .data[[value]],
+                   y = .data[[x_cond]],
+                   fill = .data[[fill_cond]]),
+               position = 'dodge', 
+               stat = 'identity') +
+      theme_light() +
+      xlim(min, max) +
+      labs(title = "FoldEnrichment",
+           x = y_labels,
+           y = x_labels) +
+      scale_fill_viridis_c(option = "mako", begin = 0, end = 0.9) +
+      theme(legend.position = "right",
+            text = element_text(size = 8),
+            axis.text.y = element_text(angle = 0, hjust = 1))
+   
+   # Scatter plot
+   p2 <- stat_df %>%
+      ggplot() +
+      geom_point(aes(x = GeneRatio, 
+                     y = .data[[x_cond]],
+                     color = .data[[fill_cond]],
+                     size = Count),
+                     shape = 16) +
+      theme_light() +
+      theme(legend.position = "right",
+            text = element_text(size = 8)) +
+      xlim(0, 0.8) +
+      labs(title = "GeneRatio",
+           x = "GeneRatio", 
+           y = NULL) +
+      scale_color_viridis_c(option = "mako", begin = 0, end = 0.9)
+   
+   return(list(p1 = p1, p2 = p2))
+}
+
+###########################################################################
+# MM
+###########################################################################
+# prepare tibble
+plotting_df <- as_tibble(gse_enrich) %>% arrange(p.adjust) %>% slice_head(n = 10)
+plotting_df$GeneRatio <- sapply(plotting_df$GeneRatio, function(x) eval(parse(text=x)))
+plotting_df$p.adjust <- as.numeric(plotting_df$p.adjust)
+plotting_df$zScore <- as.numeric(plotting_df$zScore)
+plotting_df$Description = str_wrap(plotting_df$Description, width = 30)
+
+# plot
+p <- global_plotting(plotting_df,
+                     value = "FoldEnrichment",
+                     x_cond = "Description",
+                     fill_cond = "p.adjust",
+                     max = 1500,
+                     min = 0)
+# plot grid
+p_grid <- plot_grid(
+  p$p1, p$p2,
+  align = TRUE,
+  axis = "lr",
+  ncol = 2
+)
+
+# title
+title <- ggdraw() + 
+  draw_label(
+    "PIK3CA HET - Enrichment",
+    fontface = 'bold',
+    size = 16,
+    x = 0.5,
+    hjust = 0.5
+  )
+
+# final plot
+final_plot <- plot_grid(
+  title, p_grid,
+  ncol = 1,
+  rel_heights = c(0.1, 1)
+)
+
+ggsave("/courses/BINF6430.202510/students/wlodychak.s/final_project/data/pik3ca_dataset/results/het.plot.png", final_plot, h = 7, w = 15)
+
+```

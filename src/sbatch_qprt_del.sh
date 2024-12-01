@@ -30,6 +30,7 @@ snakemake -s /courses/BINF6430.202510/students/wlodychak.s/final_project/CRISPRr
     --use-singularity \
     --singularity-args "--bind $PWD:$PWD --bind /courses/BINF6430.202510/students/wlodychak.s/final_project:/courses/BINF6430.202510/students/wlodychak.s/final_project" \
     --latency-wait 60 \
+    --until CRISPRoff \
     --rerun-incomplete \
     --keep-going \
     --configfile /courses/BINF6430.202510/students/wlodychak.s/final_project/data/qprt_dataset/config.del.yaml
